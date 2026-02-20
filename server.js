@@ -6,7 +6,6 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -30,37 +29,35 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Database connection
+// Database connection config
 const dbConfig = {
   host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
+  port: parseInt(process.env.DB_PORT) || 3306,
   user: process.env.DB_USERNAME,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   ssl: {
     rejectUnauthorized: false
   },
-  connectTimeout: 60000
+  connectTimeout: 10000,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 };
 
-let db;
+let pool;
 
-// Initialize database connection
-async function initializeDatabase() {
-  try {
-    db = await mysql.createConnection(dbConfig);
-    console.log('✅ Connected to MySQL database');
-    
-    // Create tables if they don't exist
-    await createTables();
-  } catch (error) {
-    console.error('❌ Database connection failed:', error.message);
-    process.exit(1);
+// Get or create database pool
+function getDb() {
+  if (!pool) {
+    pool = mysql.createPool(dbConfig);
   }
+  return pool;
 }
 
-// Create necessary tables
-async function createTables() {
+// Initialize tables (run once)
+async function initializeTables() {
+  const db = getDb();
   try {
     // Create koduser table
     await db.execute(`
@@ -91,10 +88,9 @@ async function createTables() {
       )
     `);
 
-    console.log('✅ Database tables created successfully');
+    console.log('✅ Database tables ready');
   } catch (error) {
     console.error('❌ Error creating tables:', error.message);
-    throw error;
   }
 }
 
@@ -102,13 +98,15 @@ async function createTables() {
 const verifyToken = async (req, res, next) => {
   try {
     const token = req.cookies.authToken;
-    
+
     if (!token) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Access denied. No token provided.' 
+      return res.status(401).json({
+        success: false,
+        message: 'Access denied. No token provided.'
       });
     }
+
+    const db = getDb();
 
     // Verify token exists in database and is active
     const [tokenRows] = await db.execute(
@@ -117,9 +115,9 @@ const verifyToken = async (req, res, next) => {
     );
 
     if (tokenRows.length === 0) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Invalid or expired token.' 
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid or expired token.'
       });
     }
 
@@ -129,9 +127,9 @@ const verifyToken = async (req, res, next) => {
     next();
   } catch (error) {
     console.error('Token verification error:', error.message);
-    res.status(401).json({ 
-      success: false, 
-      message: 'Invalid token.' 
+    res.status(401).json({
+      success: false,
+      message: 'Invalid token.'
     });
   }
 };
@@ -139,16 +137,29 @@ const verifyToken = async (req, res, next) => {
 // Routes
 
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    success: true, 
-    message: 'KodBank API is running!', 
-    timestamp: new Date().toISOString() 
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    const db = getDb();
+    await db.execute('SELECT 1');
+    res.json({
+      success: true,
+      message: 'KodBank API is running!',
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.json({
+      success: true,
+      message: 'KodBank API is running!',
+      timestamp: new Date().toISOString(),
+      database: 'disconnected'
+    });
+  }
 });
 
 // User Registration
 app.post('/api/register', async (req, res) => {
+  let db;
   try {
     const { uid, uname, password, email, phone } = req.body;
 
@@ -159,6 +170,11 @@ app.post('/api/register', async (req, res) => {
         message: 'All fields are required'
       });
     }
+
+    db = getDb();
+
+    // Initialize tables on first request
+    await initializeTables();
 
     // Check if user already exists
     const [existingUsers] = await db.execute(
@@ -206,6 +222,7 @@ app.post('/api/register', async (req, res) => {
 
 // User Login
 app.post('/api/login', async (req, res) => {
+  let db;
   try {
     const { uname, password } = req.body;
 
@@ -215,6 +232,8 @@ app.post('/api/login', async (req, res) => {
         message: 'Username and password are required'
       });
     }
+
+    db = getDb();
 
     // Find user
     const [users] = await db.execute(
@@ -249,7 +268,7 @@ app.post('/api/login', async (req, res) => {
     };
 
     const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN
+      expiresIn: process.env.JWT_EXPIRES_IN || '24h'
     });
 
     // Calculate expiry time
@@ -293,8 +312,10 @@ app.post('/api/login', async (req, res) => {
 
 // Check Balance (Protected Route)
 app.get('/api/balance', verifyToken, async (req, res) => {
+  let db;
   try {
     const username = req.user.sub; // Extract username from JWT subject
+    db = getDb();
 
     // Fetch user balance
     const [users] = await db.execute(
@@ -331,9 +352,11 @@ app.get('/api/balance', verifyToken, async (req, res) => {
 
 // Logout
 app.post('/api/logout', verifyToken, async (req, res) => {
+  let db;
   try {
     const token = req.cookies.authToken;
-    
+    db = getDb();
+
     // Deactivate token in database
     await db.execute(
       'UPDATE UserToken SET is_active = FALSE WHERE token = ?',
@@ -388,30 +411,5 @@ app.use((req, res) => {
   });
 });
 
-// Start server
-async function startServer() {
-  try {
-    await initializeDatabase();
-    
-    app.listen(PORT, () => {
-      console.log(`🚀 KodBank server running on port ${PORT}`);
-      console.log(`🌐 API available at: http://localhost:${PORT}/api`);
-      console.log(`🔍 Health check: http://localhost:${PORT}/api/health`);
-    });
-  } catch (error) {
-    console.error('❌ Failed to start server:', error.message);
-    process.exit(1);
-  }
-}
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  if (db) {
-    await db.end();
-    console.log('✅ Database connection closed');
-  }
-  process.exit(0);
-});
-
-startServer();
+// Export for Vercel
+module.exports = app;
